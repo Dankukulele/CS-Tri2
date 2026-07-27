@@ -21,6 +21,7 @@ const dashboardRoutes = require('./src/routers/dashboard.router');
 const notificationRoutes = require('./src/routers/notification.router');
 const alertSegmentRoutes = require('./src/routers/alertSegment.router');
 const listRoutes = require('./src/routers/list.router');
+const inputSanitisation = require('./src/middleware/inputSanitisation.middleware');
 
 if (process.env.NODE_ENV !== 'production') {
    require('dotenv').config({ path: path.join(__dirname, '.env') });
@@ -82,8 +83,31 @@ app.use(cors({
 }));
 
 // Middleware
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// Request payload limits can be changed through environment variables.
+const JSON_BODY_LIMIT = process.env.JSON_BODY_LIMIT || '100kb';
+const FORM_BODY_LIMIT = process.env.FORM_BODY_LIMIT || '50kb';
+
+// Limit JSON payloads to reduce oversized payload attacks.
+app.use(
+  express.json({
+    limit: JSON_BODY_LIMIT,
+    strict: true,
+  })
+);
+
+// Limit form payload size, parameter count and nesting depth.
+app.use(
+  express.urlencoded({
+    extended: true,
+    limit: FORM_BODY_LIMIT,
+    parameterLimit: 100,
+    depth: 5,
+  })
+);
+
+// Check request bodies and query strings for unsafe input.
+app.use(inputSanitisation);
+
 app.use('/uploads', express.static(uploadsDir));
 
 // Initialize Swagger
@@ -202,8 +226,69 @@ app.get('/', (req, res) => {
 
 // Global Error Handling Middleware
 app.use((err, req, res, next) => {
-    console.error(err.stack);
-    res.status(500).json({ message: 'Something went wrong!' });
+  // Handle oversized JSON and form payloads.
+  if (
+    err.type === 'entity.too.large' ||
+    err.type === 'parameters.too.many' ||
+    err.status === 413
+  ) {
+    console.warn('Oversized payload blocked', {
+      ip: req.ip,
+      method: req.method,
+      path: req.originalUrl,
+    });
+
+    return res.status(413).json({
+      success: false,
+      message: 'Request payload is too large.',
+    });
+  }
+
+  // Handle oversized Multer file uploads.
+  if (err.code === 'LIMIT_FILE_SIZE') {
+    console.warn('Oversized file upload blocked', {
+      ip: req.ip,
+      method: req.method,
+      path: req.originalUrl,
+    });
+
+    return res.status(413).json({
+      success: false,
+      message: 'Uploaded file is too large.',
+    });
+  }
+
+  // Handle malformed JSON.
+  if (err.type === 'entity.parse.failed') {
+    return res.status(400).json({
+      success: false,
+      message: 'Invalid JSON request.',
+    });
+  }
+
+  // Handle excessively nested form data.
+  if (
+    err.type === 'querystring.parse.rangeError' ||
+    (err.status === 400 && err.message === 'The input exceeded the depth')
+  ) {
+    console.warn('Excessively nested payload blocked', {
+      ip: req.ip,
+      method: req.method,
+      path: req.originalUrl,
+    });
+
+    return res.status(400).json({
+      success: false,
+      message: 'Request payload is nested too deeply.',
+    });
+  }
+
+  console.error(err.stack);
+
+  return res.status(500).json({
+    success: false,
+    message: 'Something went wrong!',
+  });
 });
 
 // Start the server
