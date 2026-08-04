@@ -1,9 +1,18 @@
 /*
  * Main server configuration for the DiscountMate backend.
- * This file sets up security controls, CORS, payload limits, input sanitisation,
- * API routes, database connections, error handling and supporting services.
+ *
+ * This file creates and configures the Express server, loads environment
+ * variables, connects to MongoDB and starts supporting services such as
+ * the reverse image search service.
+ *
+ * It also applies the main backend security controls, including security
+ * headers, trusted CORS origins, request payload limits, input sanitisation,
+ * proxy configuration and central error handling.
+ *
+ * The server supports local development and managed cloud environments.
+ * Sensitive values such as the MongoDB connection string and JWT secret
+ * are loaded from environment variables or Google Cloud Secret Manager.
  */
-
 
 // Import Express to create the DiscountMate backend server.
 const express = require('express');
@@ -33,9 +42,11 @@ const basketRoutes = require('./src/routers/basket.router');
 const shoppingListRoutes = require('./src/routers/shopping-list.router');
 const mlRoutes = require('./src/routers/ml.router');
 const analyticsRoutes = require('./src/routers/analytics.router');
+
 const reverseImageSearchRoutes = require(
    './src/routers/reverse-image-search.router'
 );
+
 const dashboardRoutes = require('./src/routers/dashboard.router');
 const notificationRoutes = require('./src/routers/notification.router');
 const alertSegmentRoutes = require('./src/routers/alertSegment.router');
@@ -54,7 +65,7 @@ const {
 
 /*
  * Load local environment variables when the application is not running
- * in production. Production values are provided by the cloud environment.
+ * in production. Production values are supplied by the cloud environment.
  */
 if (process.env.NODE_ENV !== 'production') {
    require('dotenv').config({
@@ -62,7 +73,7 @@ if (process.env.NODE_ENV !== 'production') {
    });
 }
 
-// Import Swagger configuration after the environment variables are loaded.
+// Import the Swagger configuration after environment variables are loaded.
 const setupSwagger = require('./src/config/swagger');
 
 // Create the Express application.
@@ -71,15 +82,15 @@ const app = express();
 /*
  * Remove the default "X-Powered-By: Express" response header.
  *
- * This prevents the backend from unnecessarily revealing that it uses
- * Express and reduces technology information disclosure.
+ * This prevents the backend from unnecessarily revealing the framework
+ * it uses and reduces technology information exposure.
  */
 app.disable('x-powered-by');
 
 // Use the configured port or fall back to port 8080.
 const PORT = process.env.PORT || 8080;
 
-// Check whether the application is running in production.
+// Check whether the backend is running in production.
 const isProduction = process.env.NODE_ENV === 'production';
 
 // Detect managed environments such as Google Cloud Run or App Engine.
@@ -88,32 +99,65 @@ const isManagedCloudRuntime = Boolean(
 );
 
 /*
- * Read the approved CORS origins from the environment configuration.
+ * CS-10-T3: Read the trusted frontend origins from the environment.
  *
- * Multiple trusted origins can be separated using commas.
+ * Multiple trusted frontend origins can be entered in CORS_ORIGIN by
+ * separating them with commas.
+ *
+ * Example:
+ * CORS_ORIGIN=http://localhost:8081,https://discountmate.example.com
  */
 const allowedOrigins = (process.env.CORS_ORIGIN || '')
    .split(',')
-   .map((value) => value.trim())
+   .map((origin) => origin.trim())
    .filter(Boolean);
 
 /*
- * Check incoming browser origins against the approved origin list.
+ * Prevent the production server from starting without a trusted frontend.
  *
- * Requests without an Origin header are allowed because they may come
- * from tools, mobile applications or other backend services.
+ * This avoids accidentally deploying the backend with an empty or open
+ * CORS configuration.
  */
-const corsOrigin =
-   allowedOrigins.length === 0
-      ? true
-      : (origin, callback) => {
-           if (!origin || allowedOrigins.includes(origin)) {
-              callback(null, true);
-              return;
-           }
+if (isProduction && allowedOrigins.length === 0) {
+   throw new Error(
+      'CORS_ORIGIN must contain at least one trusted frontend origin in production.'
+   );
+}
 
-           callback(new Error('Origin not allowed by CORS'));
-        };
+/*
+ * CS-10-T3: Check whether an incoming browser request comes from a
+ * trusted frontend origin.
+ */
+function validateCorsOrigin(origin, callback) {
+   /*
+    * Allow requests that do not contain an Origin header.
+    *
+    * These requests may come from Postman, curl, a mobile application,
+    * another backend service or a server health check rather than a browser.
+    */
+   if (!origin) {
+      return callback(null, true);
+   }
+
+   /*
+    * Allow the request when the browser origin exactly matches one of the
+    * trusted origins configured in CORS_ORIGIN.
+    */
+   if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
+   }
+
+   /*
+    * Create a specific error for browser requests from untrusted origins.
+    *
+    * The global error handler converts this error into a controlled
+    * 403 Forbidden response.
+    */
+   const corsError = new Error('Origin not allowed by CORS');
+   corsError.code = 'CORS_NOT_ALLOWED';
+
+   return callback(corsError);
+}
 
 /*
  * Enable reverse proxy support in production.
@@ -143,7 +187,7 @@ if (!fs.existsSync(uploadsDir)) {
  * CS-10-T2: Configure strict security headers for normal API responses.
  *
  * Most DiscountMate API endpoints return JSON rather than HTML pages.
- * Therefore, scripts, forms, frames and embedded objects can be blocked.
+ * Scripts, forms, frames and embedded objects can therefore be blocked.
  */
 const apiSecurityHeaders = helmet({
    /*
@@ -155,23 +199,23 @@ const apiSecurityHeaders = helmet({
    contentSecurityPolicy: {
       /*
        * Disable Helmet's default CSP so the application uses only the
-       * explicitly defined policies below.
+       * policies explicitly defined below.
        */
       useDefaults: false,
 
       directives: {
-         // Block all content types unless they are specifically permitted.
+         // Block all content types unless specifically permitted.
          defaultSrc: ["'none'"],
 
-         // Prevent an attacker from changing the document's base URL.
+         // Prevent an attacker from changing the document base URL.
          baseUri: ["'none'"],
 
-         // Prevent API responses from being used to submit browser forms.
+         // Prevent API responses from submitting browser forms.
          formAction: ["'none'"],
 
          /*
-          * Prevent API responses from being displayed inside frames or
-          * iframes. This reduces clickjacking exposure.
+          * Prevent API responses from being placed inside frames or iframes.
+          * This helps reduce clickjacking exposure.
           */
          frameAncestors: ["'none'"],
 
@@ -193,8 +237,8 @@ const apiSecurityHeaders = helmet({
    /*
     * Enable HTTP Strict Transport Security only in production.
     *
-    * HSTS tells browsers to use HTTPS for future connections. It remains
-    * disabled during local development because localhost normally uses HTTP.
+    * HSTS instructs browsers to use HTTPS for future connections.
+    * It remains disabled locally because development normally uses HTTP.
     */
    strictTransportSecurity: isProduction
       ? {
@@ -207,8 +251,8 @@ const apiSecurityHeaders = helmet({
       : false,
 
    /*
-    * Allow uploaded images and other public resources to be loaded by
-    * the separate DiscountMate frontend domain.
+    * Allow uploaded images and other public resources to be displayed
+    * by the separate DiscountMate frontend.
     */
    crossOriginResourcePolicy: {
       policy: 'cross-origin',
@@ -219,12 +263,13 @@ const apiSecurityHeaders = helmet({
  * Configure separate security headers for Swagger documentation.
  *
  * Swagger UI requires JavaScript and CSS to display the API documentation.
- * The strict API Content Security Policy could otherwise stop it from loading.
+ * The strict API Content Security Policy could otherwise prevent it from
+ * loading correctly.
  */
 const swaggerSecurityHeaders = helmet({
    /*
-    * Disable CSP only for Swagger so its JavaScript and styles can load.
-    * Other Helmet security headers will still be applied.
+    * Disable CSP only for Swagger so its scripts and styles can load.
+    * Other Helmet security headers remain enabled.
     */
    contentSecurityPolicy: false,
 
@@ -253,12 +298,12 @@ const swaggerSecurityHeaders = helmet({
 });
 
 /*
- * Apply the Swagger-compatible headers to documentation requests.
+ * Apply Swagger-compatible headers to API documentation requests.
  *
  * All other backend routes receive the stricter API security headers.
  */
 app.use((req, res, next) => {
-   // Check whether the request is for Swagger documentation.
+   // Check whether the request is for the Swagger documentation.
    if (req.path.startsWith('/api-docs')) {
       // Apply the Swagger-compatible security configuration.
       return swaggerSecurityHeaders(req, res, next);
@@ -269,25 +314,64 @@ app.use((req, res, next) => {
 });
 
 /*
- * Configure CORS for approved DiscountMate frontend origins.
- *
- * CS-10-T3 will further review and strengthen this configuration.
+ * CS-10-T3: Configure the trusted-domain CORS policy.
  */
-app.use(
-   cors({
-      // Check the request origin using the configured origin allowlist.
-      origin: corsOrigin,
+const corsOptions = {
+   /*
+    * Check every browser request origin against the trusted origin list.
+    */
+   origin: validateCorsOrigin,
 
-      // Allow only the HTTP methods required by DiscountMate.
-      methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+   /*
+    * Allow only the HTTP request methods required by DiscountMate.
+    */
+   methods: [
+      'GET',
+      'POST',
+      'PUT',
+      'PATCH',
+      'DELETE',
+      'OPTIONS',
+   ],
 
-      // Allow authenticated cross-origin requests where required.
-      credentials: true,
-   })
-);
+   /*
+    * Allow only the request headers required by the frontend.
+    *
+    * Content-Type is used for JSON data and Authorization is used when
+    * the frontend sends JWT access tokens.
+    */
+   allowedHeaders: [
+      'Content-Type',
+      'Authorization',
+   ],
+
+   /*
+    * Allow authenticated cross-origin requests.
+    *
+    * This can support cookies or other browser credentials when required.
+    * Exact trusted origins are used instead of a wildcard origin.
+    */
+   credentials: true,
+
+   /*
+    * Allow browsers to cache successful preflight results for ten minutes.
+    *
+    * This reduces repeated OPTIONS requests while still allowing CORS
+    * configuration changes to take effect within a reasonable period.
+    */
+   maxAge: 600,
+
+   /*
+    * Return the standard successful status for browser preflight requests.
+    */
+   optionsSuccessStatus: 204,
+};
+
+// Apply the trusted CORS policy before body parsing and API routes.
+app.use(cors(corsOptions));
 
 /*
- * CS-10-T1: Request payload limits can be changed through environment
+ * CS-10-T1: Request payload limits can be changed using environment
  * variables without changing the application code.
  */
 const JSON_BODY_LIMIT =
@@ -307,7 +391,7 @@ app.use(
       // Reject JSON bodies larger than the configured limit.
       limit: JSON_BODY_LIMIT,
 
-      // Only accept JSON objects and arrays as valid JSON request bodies.
+      // Only accept JSON objects and arrays as JSON request bodies.
       strict: true,
    })
 );
@@ -320,9 +404,7 @@ app.use(
  */
 app.use(
    express.urlencoded({
-      /*
-       * Allow nested form data while restricting its maximum depth below.
-       */
+      // Allow nested form data while restricting its maximum depth.
       extended: true,
 
       // Reject form bodies larger than the configured limit.
@@ -340,7 +422,7 @@ app.use(
  * Inspect request bodies and query strings for unsafe input.
  *
  * This middleware runs after body parsing but before application routes,
- * ensuring dangerous input is blocked before reaching the controllers.
+ * ensuring dangerous input is blocked before reaching controllers.
  */
 app.use(inputSanitisation);
 
@@ -539,10 +621,12 @@ app.use('/api/news', newsRoutes);
 app.use('/api/contact', contactRoutes);
 app.use('/api/ml', mlRoutes);
 app.use('/api/analytics', analyticsRoutes);
+
 app.use(
    '/api/reverse-image-search',
    reverseImageSearchRoutes
 );
+
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/alert-segments', alertSegmentRoutes);
@@ -562,6 +646,25 @@ app.get('/', (req, res) => {
  * passed from middleware, parsers, controllers and route handlers.
  */
 app.use((err, req, res, next) => {
+   /*
+    * CS-10-T3: Handle requests from browser origins that are not included
+    * in the trusted DiscountMate frontend allowlist.
+    */
+   if (err.code === 'CORS_NOT_ALLOWED') {
+      console.warn('Untrusted CORS origin blocked', {
+         origin: req.get('Origin'),
+         ip: req.ip,
+         method: req.method,
+         path: req.originalUrl,
+      });
+
+      return res.status(403).json({
+         success: false,
+         message:
+            'This origin is not permitted to access the API.',
+      });
+   }
+
    /*
     * Handle oversized JSON and URL-encoded form payloads.
     */
@@ -583,7 +686,7 @@ app.use((err, req, res, next) => {
    }
 
    /*
-    * Handle files that exceed the upload size configured by Multer.
+    * Handle files that exceed the upload limit configured by Multer.
     */
    if (err.code === 'LIMIT_FILE_SIZE') {
       console.warn('Oversized file upload blocked', {
