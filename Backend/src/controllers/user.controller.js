@@ -1,5 +1,6 @@
 require('dotenv').config();
 const axios = require('axios');
+const nodemailer = require('nodemailer'); // used to send real emails
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { rateLimit } = require('express-rate-limit');
@@ -52,6 +53,7 @@ function handleControllerError(res, error, fallbackMessage, logPrefix) {
     return res.status(500).json({ message: fallbackMessage });
 }
 
+// Validates password meets minimum length and special character rules
 function validatePasswordStrength(password) {
     if (String(password || '').length < 8) {
         return 'Password must be at least 8 characters long';
@@ -62,6 +64,29 @@ function validatePasswordStrength(password) {
     }
 
     return null;
+}
+
+const crypto = require('crypto');
+
+// Creates a random code we send users so they can confirm their email address is real
+function generateVerificationToken() {
+    return crypto.randomBytes(20).toString('hex');
+}
+
+// Sets up the connection needed to send emails from the app.
+// Returns null if the email credentials haven't been configured yet
+function createEmailTransporter() {
+    if (!process.env.SUPPORT_EMAIL_USER || !process.env.SUPPORT_EMAIL_APP_PASSWORD) {
+        return null;
+    }
+
+    return nodemailer.createTransport({
+        service: 'gmail',
+        auth: {
+            user: process.env.SUPPORT_EMAIL_USER,
+            pass: process.env.SUPPORT_EMAIL_APP_PASSWORD,
+        },
+    });
 }
 
 function normalizeAustralianPhoneNumber(value) {
@@ -419,6 +444,9 @@ const signup = async (req, res) => {
 
         const hashedPassword = await bcrypt.hash(password, 10);
 
+// Generate a random code to confirm this user's email address later
+        const verificationToken = generateVerificationToken();
+
         const user = {
             account_user_name: normalizedEmail,
             email: normalizedEmail,
@@ -429,15 +457,43 @@ const signup = async (req, res) => {
             phone_number,
             admin: admin || false,
             role: admin ? 'admin' : 'user',
+            isEmailVerified: false, // new users start unverified until they confirm their email
+            emailVerificationToken: verificationToken, // stored so we can check it later when they verify
         };
 
         const result = await db.collection('users').insertOne(user);
 
-        res.status(201).json({ message: 'User created successfully', userId: result.insertedId });
+        // Temporary: sending the token back in the response so we can test manually.
+        // Once email sending is added, this token will be emailed to the user instead.
+        res.status(201).json({ message: 'User created successfully', userId: result.insertedId, verificationToken,});
 
     } catch (error) {
         console.error('Error signing up user:', error);
         res.status(500).json({ message: 'Error signing up user' });
+    }
+};
+
+// Confirms a user's email using the token generated at signup
+const verifyEmail = async (req, res) => {
+    const { token } = req.query;
+
+    try {
+        const db = await connectToMongoDB();
+        const user = await db.collection('users').findOne({ emailVerificationToken: token });
+
+        if (!user) {
+            return res.status(400).json({ message: 'Invalid verification link' });
+        }
+
+        await db.collection('users').updateOne(
+            { _id: user._id },
+            { $set: { isEmailVerified: true } }
+        );
+
+        return res.status(200).json({ message: 'Email verified successfully' });
+    } catch (error) {
+        console.error('Error verifying email:', error);
+        return res.status(500).json({ message: 'Error verifying email' });
     }
 };
 
@@ -479,9 +535,39 @@ const signin = async (req, res) => {
         const isMatch = await bcrypt.compare(password, user.encrypted_password);
 
         if (!isMatch) {
+            const attempts = (user.failedLoginAttempts || 0) + 1; // Wrong password, so increase this user's failed attempt count by 1
+            await db.collection('users').updateOne(
+                { email: normalizedEmail },
+                { $set: { failedLoginAttempts: attempts } }
+            );
+
+            // send alert email once attempts reach 3
+            if (attempts >= 3) {
+                const transporter = createEmailTransporter();
+                if (transporter) {
+                    transporter.sendMail({
+                        from: process.env.SUPPORT_EMAIL_USER,
+                        to: normalizedEmail,
+                        subject: 'Unusual login activity',
+                        text: `${attempts} failed login attempts detected on your account.`,
+                    });
+                }
+            }
+
             return res.status(400).json({ message: 'Invalid credentials' });
         }
 
+        // Block login until the user has confirmed their email
+        if (user.isEmailVerified === false) {
+            return res.status(403).json({ message: 'Please verify your email before logging in' });
+        }
+
+        // Successful login, so reset the failed attempt count back to 0
+        await db.collection('users').updateOne(
+            { email: normalizedEmail },
+            { $set: { failedLoginAttempts: 0 } }
+        );
+        
         const role = user.role || (user.admin ? 'admin' : 'user');
         const token = jwt.sign(
             { email: normalizedEmail, role, admin: role === 'admin' },
@@ -1252,6 +1338,7 @@ module.exports = {
     signinLimiter,
     signup,
     signin,
+    verifyEmail,  // added for email confirmation feature
     getProfile,
     updateProfile,
     changePassword,
