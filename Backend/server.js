@@ -638,6 +638,17 @@ app.use('/api/lists', listRoutes);
 app.get('/', (req, res) => {
    res.send('Welcome to the DiscountMate API!');
 });
+/*
+ * CS-15-T1: Handle requests to unknown routes without
+ * exposing internal application information.
+ */
+app.use((req, res) => {
+   return res.status(404).json({
+      success: false,
+      message: 'Resource not found.',
+   });
+});
+
 
 /*
  * Global error handling middleware.
@@ -738,16 +749,25 @@ app.use((err, req, res, next) => {
    }
 
    /*
-    * Log unexpected errors internally without exposing detailed server
-    * information to the user.
+    * CS-15-T1: Log full unexpected error details internally.
+    *
+    * Detailed error information is kept in server logs and
+    * is not returned to the client.
     */
-   console.error(err.stack);
+   console.error('Unexpected backend error', {
+      method: req.method,
+      path: req.originalUrl,
+      ip: req.ip,
+      message: err.message,
+      stack: err.stack,
+   });
 
+   // Return only a generic response to the client.
    return res.status(500).json({
       success: false,
-      message: 'Something went wrong!',
+      message: 'Internal server error.',
    });
-});
+}); // <-- this was missing
 
 // Start the DiscountMate backend server.
 startServer();
