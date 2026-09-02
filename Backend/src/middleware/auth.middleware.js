@@ -4,7 +4,7 @@ const jwt = require('jsonwebtoken');
 const { logSecurityEvent } = require('../utils/securityLogger');
 
 // new Changed the logic for extracting the token from the Authorization header to explicitly check if it starts with 'Bearer '
-const verifyToken = (req, res, next) => {
+const verifyToken = async (req, res, next) => {
     const token = req.headers.authorization && req.headers.authorization.startsWith('Bearer ')
         ? req.headers.authorization.split(' ')[1] // Extract the token part after "Bearer"
         : null; // If no token is found, set it to null
@@ -23,9 +23,19 @@ const verifyToken = (req, res, next) => {
 
     try {
         const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+        // CS-12: re-check the user's role against the database instead of trusting the token
+        const { connectToMongoDB } = require('../config/database');
+        const db = await connectToMongoDB();
+        const currentUser = await db.collection('users').findOne({ email: decoded.email });
+
+        if (!currentUser) {
+            return res.status(401).json({ message: "User no longer exists" });
+        }
+
         req.user = {
             ...decoded,
-            role: decoded.role || (decoded.admin ? 'admin' : 'user')
+            role: currentUser.role || (currentUser.admin ? 'admin' : 'user'), // use the current database role, not the token's
         };
 
         next();

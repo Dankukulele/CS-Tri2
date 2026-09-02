@@ -456,8 +456,8 @@ const signup = async (req, res) => {
             user_lname,
             address,
             phone_number,
-            admin: admin || false,
-            role: admin ? 'admin' : 'user',
+            admin: false, // CS-12: always force false, ignore any client-supplied admin field
+            role: 'user', // CS-12: always force 'user', ignore any client-supplied role field
             isEmailVerified: false, // new users start unverified until they confirm their email
             emailVerificationToken: verificationToken, // stored so we can check it later when they verify
         };
