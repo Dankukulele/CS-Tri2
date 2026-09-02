@@ -11,6 +11,7 @@ const {
     getSavedListById,
     normalizeDashboardRetailer,
 } = require('../utils/savedLists');
+const { logSecurityEvent } = require('../utils/securityLogger');
 
 const PASSWORD_SPECIAL_CHARACTER_REGEX = /[^A-Za-z0-9\s]/;
 const AU_POSTCODE_REGEX = /^\d{4}$/;
@@ -45,7 +46,7 @@ function getAuthEmail(req) {
 function handleControllerError(res, error, fallbackMessage, logPrefix) {
     if (error?.statusCode === 401) {
         return res.status(401).json({
-            message: error.message || 'Invalid token, please log in again',
+            message: 'Invalid token, please log in again',
         });
     }
 
@@ -529,12 +530,28 @@ const signin = async (req, res) => {
 
         const user = await db.collection('users').findOne({ email: normalizedEmail });
         if (!user) {
+            logSecurityEvent({
+                event: 'AUTHENTICATION_FAILURE',
+                ip: req.ip,
+                method: req.method,
+                route: req.originalUrl,
+                details: [`${normalizedEmail} not found.`],
+            });
+
             return res.status(400).json({ message: 'Invalid credentials' });
         }
 
         const isMatch = await bcrypt.compare(password, user.encrypted_password);
 
         if (!isMatch) {
+            logSecurityEvent({
+                event: 'AUTHENTICATION_FAILURE',
+                ip: req.ip,
+                method: req.method,
+                route: req.originalUrl,
+                details: [`${normalizedEmail} unsuccessfully attempted to sign in.`],
+            });
+
             const attempts = (user.failedLoginAttempts || 0) + 1; // Wrong password, so increase this user's failed attempt count by 1
             await db.collection('users').updateOne(
                 { email: normalizedEmail },
@@ -567,6 +584,14 @@ const signin = async (req, res) => {
             { email: normalizedEmail },
             { $set: { failedLoginAttempts: 0 } }
         );
+
+        logSecurityEvent({
+            event: 'AUTHENTICATION_SUCCESS',
+            ip: req.ip,
+            method: req.method,
+            route: req.originalUrl,
+            details: [`${normalizedEmail} signed in successfully.`],
+        });
         
         const role = user.role || (user.admin ? 'admin' : 'user');
         const token = jwt.sign(
@@ -837,7 +862,7 @@ const getAddressSuggestions = async (req, res) => {
     } catch (error) {
         if (error?.statusCode === 401) {
             return res.status(401).json({
-                message: error.message || 'Invalid token, please log in again',
+                message: 'Invalid token, please log in again',
             });
         }
 
@@ -1213,7 +1238,7 @@ const updateProfileImage = async (req, res) => {
     } catch (error) {
         if (error?.statusCode === 401) {
             return res.status(401).json({
-                message: error.message || 'Invalid token, please log in again',
+                message: 'Invalid token, please log in again',
             });
         }
 
@@ -1231,16 +1256,7 @@ const updateProfileImage = async (req, res) => {
 const saveReceiptToProfile = async (req, res) => {
 
     try {
-        const token = req.headers.authorization && req.headers.authorization.split(' ')[1];
-
-        if (!token) {
-            return res.status(401).json({
-                message: 'No token provided, please log in'
-            });
-        }
-
-        const decoded = jwt.verify(token, process.env.JWT_SECRET);
-        const email = decoded.email;
+        const email = getAuthEmail(req);
 
         const { store_name, items } = req.body;
 
@@ -1285,6 +1301,12 @@ const saveReceiptToProfile = async (req, res) => {
         });
 
     } catch (error) {
+        if (error?.statusCode === 401) {
+            return res.status(401).json({
+                message: 'Invalid token, please log in again',
+            });
+        }
+
         console.error('Error saving receipt to profile:', error);
 
         return res.status(500).json({
@@ -1297,15 +1319,7 @@ const saveReceiptToProfile = async (req, res) => {
 const getProfileImage = async (req, res) => {
 
     try {
-        const token = req.headers.authorization &&
-                      req.headers.authorization.split(' ')[1];
-
-        if (!token) {
-            return res.status(401).json({ message: 'No token provided' });
-        }
-
-        const decoded = jwt.verify(token, process.env.JWT_SECRET);
-        const email = decoded.email;
+        const email = getAuthEmail(req);
 
         const db = await connectToMongoDB();
         const user = await db.collection('users').findOne({ email });
@@ -1325,6 +1339,12 @@ const getProfileImage = async (req, res) => {
       res.setHeader('Content-Type', user.profile_image.mime || 'application/octet-stream');
       return res.status(200).send(imageBuffer);
     } catch (error) {
+        if (error?.statusCode === 401) {
+            return res.status(401).json({
+                message: 'Invalid token, please log in again',
+            });
+        }
+
         console.error('Error fetching profile image:', error);
 
         return res.status(500).json({
